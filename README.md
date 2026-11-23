@@ -33,7 +33,7 @@ curl -s localhost:8002/v1/chat/completions -H 'content-type: application/json' \
 * `POST /v1/chat/completions` — every request is answered with checked reasoning (stream or not). A leading trigger prefix such
   as `med:` (config `triggers`) is removed, so a gateway can route by prefix. Tools and earlier reasoning in the request are ignored.
   Streams carry `reasoning_content` (released steps and `[sentinel: …]` notes), `content`, and on the last chunk llama-server-style
-  `timings` plus a `sentinel` report: `interventions`, `flagged`, `steps_checked`, `critic_ms`, `attempts`.
+  `timings` plus a `sentinel` report: `interventions`, `flagged`, `steps_checked`, `critic_ms`, `attempts`, `format`.
 * `GET /v1/models`, `GET /health`.
 * Library: `SentinelRun(cfg, backend_client, SystemOneCritic(cfg), messages).events()`.
 * Behind [llama-mcp-router](https://github.com/u9401066/llama-mcp-router) (≥ 0.12): `--routes` with
@@ -52,6 +52,16 @@ curl -s localhost:8002/v1/chat/completions -H 'content-type: application/json' \
 | `max_per_check`, `max_interventions` | 2, 4 | per rule / per answer; afterwards steps pass with a note and the answer gets a `warning` |
 | `case_chars`, `context_chars` | 2000, 1200 | how much of the user's messages / accepted reasoning the critic sees |
 | `system`, `annotate`, `warning` | –, true, … | default system prompt; `[sentinel: …]` notes; warning text (`{labels}`) |
+
+**Reasoning formats** (detected from the rendered prompt; the `sentinel` report names it as `format`):
+
+| format | models | reasoning starts | reasoning ends | answer requested with |
+|---|---|---|---|---|
+| `think` | Qwen3 / Qwen3.5 / Bonsai, DeepSeek-R1 style | template ends with `<think>` | `</think>` in the text | `</think>\n\n` |
+| `inkling` | Inkling 2 (Thinking Machines) | `<\|message_model\|><\|content_thinking\|>` is appended | `<\|end_message\|>` by token id (`return_tokens`; llama-server strips special tokens from the text) | `<\|end_message\|><\|message_model\|><\|content_text\|>` |
+
+With `inkling` the sentinel always opens the reasoning, even for `reasoning_effort: none`; Inkling usually writes its reasoning in
+English and in long paragraphs, so steps are mostly cut at `max_step_chars`.
 
 Rolling back is a new `/completion` request with the accepted text as prompt — llama-server's prefix cache keeps it cheap (the
 accepted reasoning is re-read at ~2,800 tokens/s on a 27B ternary model), and it works for hybrid/recurrent models (Qwen3.5) whose

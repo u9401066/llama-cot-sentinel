@@ -12,8 +12,9 @@ For each reasoning step (a paragraph of the thinking):
   first-person correction (e.g. "Before any benign explanation I must first rule out ...");
 * a step that breaks an ``inject`` check is kept, followed by a first-person reflection ("Wait, ..."), and generation goes on.
 
-The final answer (after ``</think>``) is held until it is complete and checked paragraph by paragraph; if a paragraph breaks a
-rule, the answer is discarded and the model goes back to thinking with the correction.
+The final answer (after the end of the reasoning: ``</think>``, or Inkling 2's ``<|end_message|>`` token, see
+``ReasoningFormat``) is held until it is complete and checked paragraph by paragraph; if a paragraph breaks a rule, the answer
+is discarded and the model goes back to thinking with the correction.
 
 Rolling back is a new request with the accepted text as prompt: llama-server's prefix cache keeps it cheap (hybrid/recurrent
 models such as Qwen3.5 cannot cut their state at an arbitrary token, so ``seq_rm``-style truncation is not used). Each check
@@ -37,6 +38,35 @@ import httpx
 log = logging.getLogger("llama_cot_sentinel")
 
 THINK_END = "</think>"
+
+
+@dataclass(frozen=True)
+class ReasoningFormat:
+    """How a chat template marks the reasoning.
+
+    ``open`` is appended to the rendered prompt to start the reasoning, ``close`` is appended to ask for the answer, and
+    ``close_token`` is the special token that ends the reasoning when llama-server strips special tokens from the streamed
+    text (it is then found by token id and fed to the segmenter as ``</think>``).
+    """
+
+    name: str
+    open: str = ""
+    close: str = THINK_END + "\n\n"
+    close_token: str = ""
+
+
+THINK_TAGS = ReasoningFormat("think")
+INKLING = ReasoningFormat("inkling", open="<|message_model|><|content_thinking|>",
+                          close="<|end_message|><|message_model|><|content_text|>", close_token="<|end_message|>")
+
+
+def detect_format(rendered: str) -> Tuple[ReasoningFormat, bool]:
+    """(format, whether the prompt starts in the reasoning) for a prompt rendered by ``/apply-template``."""
+    if "<|message_user|>" in rendered and "<|end_message|>" in rendered:
+        return INKLING, True  # Inkling 2: the template adds no generation prompt; the model writes its own header
+    return THINK_TAGS, rendered.rstrip().endswith("<think>")
+
+
 _TIMING_KEYS = ("prompt_n", "prompt_ms", "cache_n", "predicted_n", "predicted_ms", "draft_n", "draft_n_accepted")
 
 
@@ -250,6 +280,17 @@ class SentinelRun:
         r.raise_for_status()
         return r.json()["prompt"]
 
+    async def _token_id(self, text: str) -> Optional[int]:
+        """Id of a special token (None if the backend does not know it as a single token)."""
+        try:
+            r = await self.backend.post("/tokenize", json={"content": text, "add_special": False, "parse_special": True})
+            r.raise_for_status()
+            ids = r.json().get("tokens") or []
+        except (httpx.HTTPError, ValueError) as e:
+            log.warning("sentinel could not look up %r: %s", text, e)
+            return None
+        return ids[0] if len(ids) == 1 and isinstance(ids[0], int) else None
+
     async def _judge(self, context: str, step: str) -> Optional[Tuple[Check, float, bool]]:
         """The most likely broken check as (check, p, may_fire); may_fire is False once its limits are used up."""
         broken = await self._broken(context, step)
@@ -282,9 +323,13 @@ class SentinelRun:
 
     async def events(self) -> AsyncIterator[Dict[str, Any]]:
         rendered = await self._render()
-        thinking = rendered.rstrip().endswith("<think>")
+        fmt, thinking = detect_format(rendered)
+        rendered += fmt.open
+        end_id = await self._token_id(fmt.close_token) if fmt.close_token else None
+        if fmt.close_token and end_id is None:
+            log.warning("sentinel: %s reasoning end token unknown; the answer is requested after the reasoning", fmt.name)
         accepted = ""  # reasoning text the model continues from
-        answer_prefix = ""  # "</think>" when the answer is requested explicitly
+        answer_prefix = ""  # fmt.close when the answer is requested explicitly
         forced = False
         produced = 0
         while True:
@@ -294,12 +339,16 @@ class SentinelRun:
             body = {"prompt": rendered + accepted + answer_prefix, "stream": True, "cache_prompt": True, "n_predict": max(1024 if answer_prefix else 64, self.cfg.max_tokens - produced),
                     "temperature": self.options.get("temperature", self.cfg.temperature), "top_p": self.options.get("top_p", self.cfg.top_p),
                     "timings_per_token": True}
+            if end_id is not None:
+                body["return_tokens"] = True
             last_timings = None
             async with self.backend.stream("POST", "/completion", json=body) as r:
                 r.raise_for_status()
                 pieces = self._pieces(r)
-                async for piece, timings, stop in pieces:
+                async for piece, timings, stop, tokens in pieces:
                     last_timings = timings or last_timings
+                    if end_id is not None and seg.thinking and end_id in tokens:
+                        piece += THINK_END
                     steps = seg.feed(piece) + (seg.flush() if stop else [])
                     for kind, step in steps:
                         if kind == "reasoning":
@@ -349,9 +398,8 @@ class SentinelRun:
                 # generation ended inside the reasoning (end of sequence or token budget): close it and ask for the answer
                 forced = True
                 accepted += "\n"
-                rendered_answer = THINK_END + "\n\n"
                 thinking = False
-                answer_prefix = rendered_answer
+                answer_prefix = fmt.close
                 continue
             warning = ""
             if content and self.cfg.check_answer:
@@ -383,10 +431,10 @@ class SentinelRun:
             if content:
                 yield {"type": "content", "text": "".join(content).lstrip("\n") + warning}
             yield {"type": "done", "interventions": self.interventions, "steps_checked": self.steps_checked, "flagged": self.flagged,
-                   "critic_ms": round(self.critic_ms, 1), "timings": self.timings, "attempts": self.attempts}
+                   "critic_ms": round(self.critic_ms, 1), "timings": self.timings, "attempts": self.attempts, "format": fmt.name}
             return
 
-    async def _pieces(self, r: httpx.Response) -> AsyncIterator[Tuple[str, Optional[Dict[str, Any]], bool]]:
+    async def _pieces(self, r: httpx.Response) -> AsyncIterator[Tuple[str, Optional[Dict[str, Any]], bool, List[int]]]:
         async for line in r.aiter_lines():
             if not line.startswith("data: "):
                 continue
@@ -396,6 +444,6 @@ class SentinelRun:
                 continue
             if d.get("stop"):
                 self.attempts.append({"tokens": d.get("tokens_predicted"), "stop": d.get("stop_type"), "n_predict": (d.get("generation_settings") or {}).get("n_predict")})
-            yield d.get("content", ""), d.get("timings"), bool(d.get("stop"))
+            yield d.get("content", ""), d.get("timings"), bool(d.get("stop")), d.get("tokens") or []
             if d.get("stop"):
                 return

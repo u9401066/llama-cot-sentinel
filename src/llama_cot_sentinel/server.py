@@ -91,7 +91,7 @@ class Sentinel:
             return "data: %s\n\n" % json.dumps(data, ensure_ascii=False)
 
         def report(ev: Dict[str, Any]) -> Dict[str, Any]:
-            return {"sentinel": {k: ev[k] for k in ("interventions", "flagged", "steps_checked", "critic_ms", "attempts")},
+            return {"sentinel": {k: ev[k] for k in ("interventions", "flagged", "steps_checked", "critic_ms", "attempts", "format")},
                     "timings": sum_timings(ev["timings"]) or {}}
 
         if body.get("stream"):

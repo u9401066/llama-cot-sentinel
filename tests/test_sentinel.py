@@ -208,3 +208,80 @@ def test_warning_names_every_check_still_flagged():
         reasoning, content, last = ask(c)
     assert "red_flag (p=0.80), contra (p=0.70)" in content and len(gen.prompts) == 1
     assert last["sentinel"]["flagged"] == [{"check": "red_flag", "p": 0.8}, {"check": "contra", "p": 0.7}]
+
+
+INK_RENDERED = "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>case<|end_message|>"
+INK_END, INK_MODEL, INK_TEXT = 200010, 200001, 200004
+
+
+class InklingGen(Gen):
+    """Inkling 2 stand-in: special tokens are stripped from the streamed text and only visible as token ids.
+
+    In a script "|E|" stands for <|end_message|>; after the first one the model writes the answer header.
+    """
+
+    def app(self):
+        async def apply(request):
+            return JSONResponse({"prompt": INK_RENDERED})
+
+        async def tokenize(request):
+            body = await request.json()
+            special = body["content"] == "<|end_message|>" and body.get("parse_special") and not body.get("add_special")
+            return JSONResponse({"tokens": [INK_END] if special else [27, 91, 408]})
+
+        async def completion(request):
+            body = await request.json()
+            assert body.get("return_tokens") is True
+            prompt = body["prompt"][len(INK_RENDERED):]
+            self.prompts.append(prompt)
+            pieces = []
+            for n, part in enumerate(self.script(prompt).split("|E|")):
+                if n:
+                    pieces.append(("", [INK_END]))
+                    if n == 1:
+                        pieces += [("", [INK_MODEL]), ("", [INK_TEXT])]
+                pieces += [(part[i:i + 7], [100 + i]) for i in range(0, len(part), 7)]
+
+            async def gen():
+                for text, tokens in pieces:
+                    yield "data: %s\n\n" % json.dumps({"content": text, "tokens": tokens, "stop": False})
+                yield "data: %s\n\n" % json.dumps({"content": "", "stop": True, "timings": {"prompt_n": 10, "prompt_ms": 5.0, "predicted_n": 50, "predicted_ms": 500.0}})
+
+            return StreamingResponse(gen(), media_type="text/event-stream")
+
+        return Starlette(routes=[Route("/apply-template", apply, methods=["POST"]), Route("/tokenize", tokenize, methods=["POST"]),
+                                 Route("/completion", completion, methods=["POST"])])
+
+
+def make_inkling(script, flag):
+    gen = InklingGen(script)
+    transport, _ = critic(flag)
+    app = create_app(SentinelConfig(checks=CHECKS, min_step_chars=10), "http://backend", transport=httpx.ASGITransport(app=gen.app()),
+                     critic_transport=transport)
+    return TestClient(app), gen
+
+
+def test_inkling_reasoning_ends_at_a_token_id_and_a_rollback_stays_in_the_reasoning():
+    def script(prefix):
+        if "dangerous causes" not in prefix:
+            return "It is just a muscle strain.\n\nmore|E|Take an NSAID.|E|"
+        return "Rule out ACS and aortic dissection first.\n\nPlan: ECG and troponin now.\n|E|Most likely ACS until proven otherwise.|E|"
+
+    c, gen = make_inkling(script, lambda s: {"red_flag": 0.93} if "muscle strain" in s else {})
+    with c:
+        reasoning, content, last = ask(c)
+    opened = "<|message_model|><|content_thinking|>"
+    assert gen.prompts == [opened, opened + "I must first rule out the dangerous causes.\n\n"]
+    assert "muscle strain" not in reasoning + content and reasoning.endswith("Plan: ECG and troponin now.\n")
+    assert content == "Most likely ACS until proven otherwise." and last["sentinel"]["format"] == "inkling"
+
+
+def test_inkling_answer_is_requested_with_its_own_answer_header():
+    def script(prefix):
+        return "Final answer: rule out SAH with CT.|E|" if prefix.endswith("<|end_message|><|message_model|><|content_text|>") else "Thinking about SAH and CT.\n\nMore thinking"
+
+    c, gen = make_inkling(script, lambda s: {})
+    with c:
+        reasoning, content, _ = ask(c)
+    assert gen.prompts[1] == "<|message_model|><|content_thinking|>Thinking about SAH and CT.\n\nMore thinking\n<|end_message|><|message_model|><|content_text|>"
+    assert content == "Final answer: rule out SAH with CT." and "</think>" not in reasoning + content

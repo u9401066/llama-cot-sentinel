@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-cot-sentinel"
-version = "0.1.0"
+version = "0.2.0"
 description = "Step-checked chain of thought for llama-server: a decision model (Clef / Clef-Flash, any SystemOne API) reviews every reasoning step and steers the model with rollback or reflection."
 readme = "README.md"
 license = { text = "MIT" }
